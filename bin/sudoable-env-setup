@@ -1,0 +1,179 @@
+#!/bin/bash
+
+set -eu
+
+env=${1:-none}
+
+port=5900
+if ! [ -z "${PORT_OFFSET:-}" ]; then
+((port=port+PORT_OFFSET))
+fi
+
+# SECURITY CRITICAL: we assume that the environment can be entirely
+# compromised, so that the user can run arbitrary code as the "nobody"
+# user, and thus run this script with arbitrary arguments.
+#
+# We make sure *never* to open the EC2 metadata IP or internal IPs,
+# except where a hole has been specifically requested (this is needed
+# when envs share Kube pods with workers.)
+
+####### STEP 1: disable all outbound traffic
+
+if [ -f /usr/local/openai/privileged_flags/SECURITY_HOLE_ALLOW_INTERNAL_TRAFFIC ]; then
+    SECURITY_HOLE_ALLOW_INTERNAL_TRAFFIC=$(cat /usr/local/openai/privileged_flags/SECURITY_HOLE_ALLOW_INTERNAL_TRAFFIC)
+fi
+
+if [ "${SECURITY_HOLE_ALLOW_INTERNAL_TRAFFIC:-}" = true ]; then
+    echo "[$(date)] [$0] WARNING: SECURITY_HOLE_ALLOW_INTERNAL_TRAFFIC=$SECURITY_HOLE_ALLOW_INTERNAL_TRAFFIC, meaning that the environment can access internal IP addresses, including the EC2 metadata IP. Make sure all access to the VNC server is trusted."
+    # There's a moment here where the EC2 metadata server is open, but
+    # that's ok because 10.x access already gives you the entire
+    # Flannel space.
+    iptables -F
+    iptables -A OUTPUT -d 10.0.0.0/8 -j ACCEPT
+    iptables -P OUTPUT DROP
+else
+    # Temporarily disable all outbound traffic, since we'll be opening the
+    # firewall in the meanwhile.
+    iptables -P OUTPUT DROP
+    # Flush any rules from previous runs of this script.
+    iptables -F
+fi
+
+######## STEP 2: Make sure /etc/hosts contains the override IPs
+
+munge() {
+    ip_host="$1"
+    if ! grep -qF "$ip_host" /etc/hosts; then
+	/app/universe-envs/flashgames/vendor/mungehosts --add-host "$ip_host"
+    fi
+}
+
+# Enable each line from the ALLOWED_OUTBOUND files
+if [ -f /usr/local/openai/privileged_flags/ALLOWED_OUTBOUND ]; then
+    echo "ALLOWED_OUTBOUND" `cat /usr/local/openai/privileged_flags/ALLOWED_OUTBOUND`
+    cat /usr/local/openai/privileged_flags/ALLOWED_OUTBOUND | while read ip_host; do
+	ip=$(echo "$ip_host" | cut -f 1 -d ' ')
+
+	# Allow all traffic to that IP
+	echo "Adding $ip to iptables"
+	iptables -A OUTPUT --dst "$ip" -j ACCEPT
+	munge "$ip_host"
+    done
+fi
+
+######## STEP 3: put in place the relevant rules
+
+# Common rules
+
+# Whitelist local and VNC server traffic
+xvnc=127.0.0.1
+iptables -A OUTPUT -p tcp -m tcp --dport "${port}" --dst "$xvnc" -j ACCEPT # allow VNC (for macros)
+iptables -A OUTPUT -p tcp -m tcp --dst 127.0.0.1 -j ACCEPT # allow localhost traffic (for selenium, and maybe VNC)
+iptables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT # allow us to reply to inboud connections (for rewarder + VNC)
+
+# Allow DNS.
+for ip in $(grep nameserver /etc/resolv.conf | grep -v -E "^#" | cut -f 2 -d ' '); do
+	iptables -A OUTPUT -p udp -m udp --dport 53 --dst "$ip" -j ACCEPT
+	# could also do TCP, but doesn't seem needed:
+	# iptables -A OUTPUT -p tcp -m tcp --dport 53 --dst "$ip" -j ACCEPT
+done
+
+# For demonstrations only.
+if [ -f /usr/local/openai/privileged_flags/ALLOW_DEMO_UPLOAD_TRAFFIC ]; then
+    echo "[$(date)] [$0] Allowing outbound network traffic to Amazon and GitHub IPs for $env."
+    # Allow Amazon S3 traffic.
+    iptables -A OUTPUT -p tcp --dport 443 -d ip-ranges.amazonaws.com -j ACCEPT
+    for ip in $(/app/universe-envs/flashgames/bin/get_s3_ip_ranges); do
+	echo "iptables: -dst $ip"
+        iptables -A OUTPUT -p tcp -m multiport --dports 80,443 -d "$ip" -j ACCEPT
+    done
+    # Allow github and git-lfs traffic.
+    # https://help.github.com/articles/what-ip-addresses-does-github-use-that-i-should-whitelist/
+    for ip in "192.30.252.0/22" "git-lfs.github.com" "github-cloud.s3.amazonaws.com" "s3-1-w.amazonaws.com"; do
+        iptables -A OUTPUT -p tcp -d "$ip" -j ACCEPT
+    done
+fi
+
+if [ "$env" = "git-lfs" ]; then
+    name=${2:-none}
+    echo "[$(date)] [$0] Allowing outbound network traffic to non-private IPs for $env. (Going to fetch files via git lfs.)"
+
+    # Drop EC2 metadata IP. Note on Travis, this IP is the DNS server.
+    iptables -A OUTPUT -d 169.254.169.254 -j REJECT
+
+    # Drop other internal traffic
+    # iptables -A OUTPUT -d 192.168.0.0/16 -j REJECT
+    iptables -A OUTPUT -d 172.16.0.0/12 -j REJECT
+    iptables -A OUTPUT -d 10.0.0.0/8 -j REJECT
+
+    # Alllow traffic
+    iptables -P OUTPUT ACCEPT
+
+    if [ "$name" = "diagnostics" ]; then
+
+        echo "[$(date)] [$0] [info] uname: $(uname -a)"
+        echo "[$(date)] [$0] [info] id: $(id)"
+        echo "[$(date)] [$0] [info] ulimit:"
+        ulimit -a
+        echo "[$(date)] [$0] [info] Environment:"
+        env
+        echo "[$(date)] [$0] [info] /etc/resolv.conf:"
+        cat /etc/resolv.conf
+        echo "[$(date)] [$0] [info] Running iptables -vnL:"
+        iptables -vnL
+        echo "[$(date)] [$0] [info] Trying nslookup github.com..."
+        nslookup github.com
+        echo "[$(date)] [$0] [info] Trying ssh -vnT git@github.com..."
+        ssh -vnT git@github.com || true
+        echo "[$(date)] [$0] [info] Trying curl -vsSL -o /dev/null https://github.com/..."
+        curl -vsSL -o /dev/null https://github.com/ || true
+        echo "[$(date)] [$0] [info] Running iptables -vnL again:"
+        iptables -vnL
+        echo "[$(date)] [$0] [info] Trying unpack-lfs flashgames.Zombonarium-v0"
+        /app/universe-envs/flashgames/build/bin/unpack-lfs flashgames.Zombonarium-v0
+        echo "[$(date)] [$0] [info] Running iptables -vnL again:"
+        iptables -vnL
+
+    elif ! [ -e /usr/local/openai/git-lfs/"$name" ]; then
+    	/app/universe-envs/flashgames/build/bin/unpack-lfs "$name"
+    	echo "[$(date)] [$0] [debug] unpack-lfs completed with status code: $?. Created completion file: /usr/local/openai/git-lfs/$name"
+    	# Write out completion file; needed while we have issues with
+    	# unpack-lfs failing but the sudo invocation returning 0.
+    	mkdir -p /usr/local/openai/git-lfs
+    	touch /usr/local/openai/git-lfs/"$name"
+    else
+    	echo "[$(date)] [$0] Completion file /usr/local/openai/git-lfs/$name exists; not git-lfs pulling"
+    fi
+elif [ "$env" = "internet.SlitherIO-v0" -o "$env" = "internet.SlitherIOErmiyaEskandaryBot-v0" -o "$env" = "internet.SlitherIOEasy-v0" -o "$env" = "internet.SlitherIONoSkins-v0" ]; then
+    echo "[$(date)] [$0] Allowing outbound network traffic to non-private IPs for $env"
+
+    # Drop EC2 metadata IP
+    iptables -A OUTPUT -d 169.254.169.254 -j REJECT
+
+    iptables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT # allow us to reply to inboud connections (for rewarder + VNC)
+    iptables -A OUTPUT -p tcp -m tcp --dport 53 -j ACCEPT # allow DNS (TODO: maybe just to IP in resolv.conf)
+    iptables -A OUTPUT -p udp -m udp --dport 53 -j ACCEPT # allow DNS
+
+    # Drop internal traffic
+    # iptables -A OUTPUT -d 192.168.0.0/16 -j REJECT
+    iptables -A OUTPUT -d 172.16.0.0/12 -j REJECT
+    iptables -A OUTPUT -d 10.0.0.0/8 -j REJECT
+
+    # Make port 80/443 outbound accessible!
+    iptables -A OUTPUT -p tcp -m multiport --dports 80,443 -j ACCEPT
+
+    # TODO: drop everything else. We can't do this yet because, doing
+    # a full `iptables -A OUTPUT -j REJECT` will cause DNS to be
+    # dropped. If we figure out the correct invocation to allow DNS,
+    # we can safely REJECT everything.
+    # iptables -A OUTPUT -p tcp -j REJECT
+    # iptables -A OUTPUT -j REJECT
+else
+    echo "[$(date)] [$0] Disabling outbound network traffic for $env"
+
+    iptables -A OUTPUT -j REJECT
+fi
+
+######## STEP 3: set the default policy to accept (unless there's an explicit jump rule)
+
+iptables -P OUTPUT ACCEPT
